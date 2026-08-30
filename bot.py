@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
+from typing import Callable
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -17,7 +19,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-from downloader import download_video, extract_url
+from downloader import cleanup_session, cleanup_stale_files, download_video, extract_url
 from mediatools import parse_time_range, rename, to_mp3, trim
 
 load_dotenv()
@@ -27,6 +29,19 @@ logging.basicConfig(level=logging.INFO)
 router = Router()
 
 TELEGRAM_UPLOAD_LIMIT = 50 * 1024 * 1024
+CLEANUP_INTERVAL_SECONDS = 60 * 60
+PROGRESS_EDIT_INTERVAL_SECONDS = 2
+
+HELP_TEXT = (
+    "Пришли мне ссылку на видео из YouTube, TikTok или Instagram — я его скачаю.\n\n"
+    "После скачивания можно:\n"
+    "🎵 Превратить в MP3\n"
+    "✂️ Обрезать по времени (`00:10-00:40`)\n"
+    "✏️ Переименовать (`Артист - Название`)\n\n"
+    "Действия можно комбинировать друг за другом: скачал → обрезал → в MP3 → переименовал.\n"
+    "Новая ссылка начинает новую цепочку и стирает предыдущий файл.\n\n"
+    "Ограничение: Telegram не даёт ботам отправлять файлы больше 50 МБ."
+)
 
 
 class Form(StatesGroup):
@@ -62,21 +77,45 @@ async def send_result(message: Message, path: Path):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer(
-        "Привет! Пришли мне ссылку на видео из YouTube, TikTok или Instagram — я его скачаю.\n\n"
-        "После скачивания можно:\n"
-        "🎵 Превратить в MP3\n"
-        "✂️ Обрезать по времени\n"
-        "✏️ Переименовать (артист + название)"
-    )
+    await message.answer(f"Привет! {HELP_TEXT}")
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(HELP_TEXT)
+
+
+def make_progress_hook(loop: asyncio.AbstractEventLoop, status: Message) -> Callable[[dict], None]:
+    last = {"pct": -1, "time": 0.0}
+
+    def on_progress(d: dict) -> None:
+        if d.get("status") != "downloading":
+            return
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        if not total:
+            return
+        pct = int(d.get("downloaded_bytes", 0) / total * 100)
+        now = time.monotonic()
+        if pct == last["pct"] or now - last["time"] < PROGRESS_EDIT_INTERVAL_SECONDS:
+            return
+        last["pct"], last["time"] = pct, now
+        future = asyncio.run_coroutine_threadsafe(
+            status.edit_text(f"Скачиваю… {pct}%"), loop
+        )
+        future.add_done_callback(lambda f: f.exception())
+
+    return on_progress
 
 
 @router.message(F.text.regexp(r"https?://\S+"))
 async def handle_link(message: Message, state: FSMContext):
     url = extract_url(message.text)
-    status = await message.answer("Скачиваю…")
+    await state.clear()
+    await asyncio.to_thread(cleanup_session, message.chat.id)
+    status = await message.answer("Скачиваю… 0%")
+    progress_hook = make_progress_hook(asyncio.get_running_loop(), status)
     try:
-        path = await asyncio.to_thread(download_video, url, message.chat.id)
+        path = await asyncio.to_thread(download_video, url, message.chat.id, progress_hook)
     except Exception as e:
         await status.edit_text(f"Не удалось скачать: {e}")
         return
@@ -167,12 +206,19 @@ async def process_rename(message: Message, state: FSMContext):
     await send_result(message, renamed_path)
 
 
+async def periodic_cleanup():
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        await asyncio.to_thread(cleanup_stale_files)
+
+
 async def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан. Скопируй .env.example в .env и вставь токен.")
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    asyncio.create_task(periodic_cleanup())
     await dp.start_polling(bot)
 
 
